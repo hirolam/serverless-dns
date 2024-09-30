@@ -82,9 +82,6 @@ export default class Log {
   _resetLevel() {
     this.d = stub();
     this.debug = stub();
-    this.lapTime = stub();
-    this.startTime = stub();
-    this.endTime = stub();
     this.i = stub();
     this.info = stub();
     this.w = stub();
@@ -96,18 +93,6 @@ export default class Log {
   withTags(...tags) {
     const that = this;
     return {
-      lapTime: (n, ...r) => {
-        return that.lapTime(n, ...tags, ...r);
-      },
-      startTime: (n, ...r) => {
-        const tid = that.startTime(n);
-        that.d(that.now() + " T", ...tags, "create", tid, ...r);
-        return tid;
-      },
-      endTime: (n, ...r) => {
-        that.d(that.now() + " T", ...tags, "end", n, ...r);
-        return that.endTime(n);
-      },
       d: (...args) => {
         that.d(that.now() + " D", ...tags, ...args);
       },
@@ -163,13 +148,7 @@ export default class Log {
         this.d = console.debug;
         this.debug = console.debug;
       case "timer":
-        this.lapTime = console.timeLog || stub(); // Stubbing required for Fastly as they do not currently support this method.
-        this.startTime = function (name) {
-          name = uid(name);
-          if (console.time) console.time(name);
-          return name;
-        };
-        this.endTime = console.timeEnd || stub(); // Stubbing required for Fastly as they do not currently support this method.
+      // deprecated; fallthrough
       case "info":
         this.i = console.info;
         this.info = console.info;

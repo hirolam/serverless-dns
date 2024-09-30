@@ -8,6 +8,12 @@
 
 // musn't import /depend on anything.
 
+export function isProd() {
+  if (!envManager) return false;
+
+  return envManager.determineEnvStage() === "production";
+}
+
 export function onFly() {
   if (!envManager) return false;
 
@@ -89,6 +95,9 @@ export function isDeno() {
   return envManager.r() === "deno";
 }
 
+/**
+ * in milliseconds
+ */
 export function workersTimeout(missing = 0) {
   if (!envManager) return missing;
   return envManager.get("WORKER_TIMEOUT") || missing;
@@ -227,12 +236,10 @@ export function shutdownTimeoutMs() {
 }
 
 export function measureHeap() {
-  // disable; webpack can't bundle memwatch; see: server-node.js
-  return false;
   if (!envManager) return false;
   const reg = region();
   if (
-    reg === "maa" ||
+    reg === "bom" ||
     reg === "sin" ||
     reg === "fra" ||
     reg === "ams" ||

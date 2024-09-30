@@ -377,9 +377,19 @@ export function isAnswerQuad0(packet) {
   return isAnswerBlocked(packet.answers);
 }
 
+export function ttl(packet) {
+  if (!hasAnswers(packet)) return 0;
+  return packet.answers[0].ttl || 0;
+}
+
+/**
+ * @param {any} dnsPacket
+ * @returns {string[]}
+ */
 export function extractDomains(dnsPacket) {
   if (!hasSingleQuestion(dnsPacket)) return [];
 
+  /** @type {string} */
   const names = new Set();
   const answers = dnsPacket.answers;
 
@@ -416,7 +426,7 @@ export function extractDomains(dnsPacket) {
 
 export function getInterestingAnswerData(packet, maxlen = 80, delim = "|") {
   if (!hasAnswers(packet)) {
-    return !util.emptyObj(packet) ? packet.rcode || "WTF" : "WTF";
+    return !util.emptyObj(packet) ? packet.rcode || "WTF1" : "WTF2";
   }
 
   // set to true if at least one ip has been captured from ans
@@ -535,6 +545,10 @@ export function getQueryType(packet) {
   return util.emptyString(qt) ? false : qt;
 }
 
+/**
+ * @param {string?} n
+ * @returns {string}
+ */
 export function normalizeName(n) {
   if (util.emptyString(n)) return n;
 

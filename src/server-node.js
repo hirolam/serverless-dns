@@ -24,9 +24,6 @@ import * as util from "./commons/util.js";
 import "./core/node/config.js";
 import { finished } from "node:stream";
 import * as nodecrypto from "./commons/crypto.js";
-// webpack can't handle node-bindings, a dependency of node-memwatch
-// github.com/webpack/webpack/issues/16029
-// import * as memwatch from "@airbnb/node-memwatch";
 
 /**
  * @typedef {net.Socket} Socket
@@ -50,6 +47,7 @@ class Stats {
     this.nofconns = 0;
     this.openconns = 0;
     this.noftimeouts = 0;
+    this.nofheapsnaps = 0;
     // avg1, avg5, avg15, adj, maxconns
     this.bp = [0, 0, 0, 0, 0];
   }
@@ -169,9 +167,8 @@ const tracker = new Tracker();
 const stats = new Stats();
 const cpucount = os.cpus().length || 1;
 const adjPeriodSec = 5;
+const maxHeapSnaps = 20;
 let adjTimer = null;
-/** @type {memwatch.HeapDiff} */
-let heapdiff = null;
 
 ((main) => {
   // listen for "go" and start the server
@@ -340,7 +337,6 @@ function systemUp() {
     trapServerEvents(hcheck);
   });
 
-  // if (envutil.measureHeap()) heapdiff = new memwatch.HeapDiff();
   heartbeat();
 }
 
@@ -360,7 +356,7 @@ function trapServerEvents(s) {
 
     const id = tracker.trackConn(s, socket);
     if (!tracker.valid(id)) {
-      log.i("tcp: not tracking; server shutting down?");
+      log.i("tcp: not tracking; server shutting down?", id);
       close(socket);
       return;
     }
@@ -372,7 +368,7 @@ function trapServerEvents(s) {
     });
 
     socket.on("error", (err) => {
-      log.d("tcp: incoming conn closed with err; " + err.message);
+      log.d("tcp: incoming conn", id, "closed:", err.message);
       close(socket);
     });
 
@@ -415,7 +411,7 @@ function trapSecureServerEvents(s) {
 
     const id = tracker.trackConn(s, socket);
     if (!tracker.valid(id)) {
-      log.i("tls: not tracking; server shutting down?");
+      log.i("tls: not tracking; server shutting down?", id);
       close(socket);
       return;
     }
@@ -462,9 +458,22 @@ function trapSecureServerEvents(s) {
   s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
     stats.tlserr += 1;
     // fly tcp healthchecks also trigger tlsClientErrors
-    log.d("tls: client err; " + err.message);
+    log.d("tls: client err;", err.message, addrstr(tlsSocket));
     close(tlsSocket);
   });
+}
+
+/**
+ * @param {TLSSocket|Socket} sock
+ */
+function addrstr(sock) {
+  if (!sock) return "";
+  if (sock.localAddress == null || sock.remoteAddress == null) return "";
+  return (
+    `[${sock.localAddress}]:${sock.localPort}` +
+    "->" +
+    `[${sock.remoteAddress}]:${sock.remotePort}`
+  );
 }
 
 /**
@@ -845,7 +854,6 @@ async function handleTCPQuery(q, socket, host, flag) {
   if (bufutil.emptyBuf(q) || !tcpOkay(socket)) return;
 
   const rxid = util.xid();
-  const t = log.startTime("handle-tcp-query-" + rxid);
   try {
     const r = await resolveQuery(rxid, q, host, flag);
     if (bufutil.emptyBuf(r)) {
@@ -860,7 +868,6 @@ async function handleTCPQuery(q, socket, host, flag) {
     ok = false;
     log.w(rxid, "tcp: send fail, err", e);
   }
-  log.endTime(t);
 
   // close socket when !ok
   if (!ok) {
@@ -945,8 +952,6 @@ async function serveHTTPS(req, res) {
 
   const buffers = [];
 
-  const t = log.startTime("recv-https");
-
   // if using for await loop, then it must be wrapped in a
   // try-catch block: stackoverflow.com/questions/69169226
   // if not, errors from reading req escapes unhandled.
@@ -957,8 +962,6 @@ async function serveHTTPS(req, res) {
   req.on("end", () => {
     const b = bufutil.concatBuf(buffers);
     const bLen = b.byteLength;
-
-    log.endTime(t);
 
     if (util.isPostRequest(req) && !dnsutil.validResponseSize(b)) {
       res.writeHead(dnsutil.dohStatusCode(b), util.corsHeadersIfNeeded(ua));
@@ -980,7 +983,6 @@ async function handleHTTPRequest(b, req, res) {
   heartbeat();
 
   const rxid = util.xid();
-  const t = log.startTime("handle-http-req-" + rxid);
   try {
     let host = req.headers.host || req.headers[":authority"];
     if (isIPv6(host)) host = `[${host}]`;
@@ -999,11 +1001,7 @@ async function handleHTTPRequest(b, req, res) {
       body: req.method === "POST" ? b : null,
     });
 
-    log.lapTime(t, "upstream-start");
-
     const fRes = await handleRequest(util.mkFetchEvent(fReq));
-
-    log.lapTime(t, "upstream-end");
 
     if (!resOkay(res)) {
       throw new Error("res not writable 1");
@@ -1011,13 +1009,9 @@ async function handleHTTPRequest(b, req, res) {
 
     res.writeHead(fRes.status, util.copyHeaders(fRes));
 
-    log.lapTime(t, "send-head");
-
     // ans may be null on non-2xx responses, such as redirects (3xx) by cc.js
     // or 4xx responses on timeouts or 5xx on invalid http method
     const ans = await fRes.arrayBuffer();
-
-    log.lapTime(t, "recv-ans");
 
     if (!resOkay(res)) {
       throw new Error("res not writable 2");
@@ -1034,8 +1028,6 @@ async function handleHTTPRequest(b, req, res) {
     if (!ok) resClose(res);
     log.w(e);
   }
-
-  log.endTime(t);
 }
 
 /**
@@ -1061,29 +1053,39 @@ function trapRequestResponseEvents(req, res) {
 }
 
 function heartbeat() {
-  const maxc = envutil.maxconns();
   const minc = envutil.minconns();
+  const maxc = envutil.maxconns();
+  const isNode = envutil.isNode();
+  const notCloud = envutil.onLocal();
   const measureHeap = envutil.measureHeap();
-
+  const freemem = os.freemem() / (1024 * 1024); // in mb
+  const totmem = os.totalmem() / (1024 * 1024); // in mb
   // increment no of requests
   stats.noreqs += 1;
 
-  if (!measureHeap) {
-    endHeapDiffIfNeeded(heapdiff);
-    heapdiff = null;
-  } else if (heapdiff == null) {
-    // heapdiff = new memwatch.HeapDiff();
-  } else if (stats.noreqs % (maxc * 10) === 0) {
-    endHeapDiffIfNeeded(heapdiff);
-    // heapdiff = new memwatch.HeapDiff();
-  }
   if (stats.noreqs % (minc * 2) === 0) {
     log.i(stats.str(), "in", (uptime() / 60000) | 0, "mins");
+  }
+
+  const mul = notCloud ? 2 : 10;
+  const writeSnap = notCloud || measureHeap;
+  const ramthres = notCloud || freemem < 0.2 * totmem;
+  const reqthres = stats.noreqs > 0 && stats.noreqs % (maxc * mul) === 0;
+  const withinLimit = stats.nofheapsnaps < maxHeapSnaps;
+  if (isNode && writeSnap && withinLimit && reqthres && ramthres) {
+    stats.nofheapsnaps += 1;
+    const n = "s" + stats.nofheapsnaps + "." + stats.noreqs + ".heapsnapshot";
+    const start = Date.now();
+    // nodejs.org/en/learn/diagnostics/memory/using-heap-snapshot
+    v8.writeHeapSnapshot(n); // blocks event loop!
+    const elapsed = (Date.now() - start) / 1000;
+    log.i("heap snapshot #", stats.nofheapsnaps, n, "in", elapsed, "s");
   }
 }
 
 function adjustMaxConns(n) {
   const isNode = envutil.isNode();
+  const notCloud = envutil.onLocal();
   const maxc = envutil.maxconns();
   const minc = envutil.minconns();
   const adjsPerSec = 60 / adjPeriodSec;
@@ -1096,6 +1098,11 @@ function adjustMaxConns(n) {
   avg1 = ((avg1 * 100) / cpucount) | 0;
   avg5 = ((avg5 * 100) / cpucount) | 0;
   avg15 = ((avg15 * 100) / cpucount) | 0;
+
+  const freemem = os.freemem() / (1024 * 1024); // in mb
+  const totmem = os.totalmem() / (1024 * 1024); // in mb
+  const lowram = freemem < 0.1 * totmem;
+  const verylowram = freemem < 0.025 * totmem;
 
   let adj = stats.bp[3] || 0;
   // increase in load
@@ -1111,7 +1118,7 @@ function adjustMaxConns(n) {
     n = maxc;
     if (avg1 > 100) {
       n = minc;
-    } else if (avg1 > 90 || avg5 > 80) {
+    } else if (avg1 > 90 || avg5 > 80 || lowram) {
       n = Math.max((n * 0.2) | 0, minc);
     } else if (avg1 > 80 || avg5 > 75) {
       n = Math.max((n * 0.4) | 0, minc);
@@ -1135,15 +1142,24 @@ function adjustMaxConns(n) {
   const breakpoint = 6 * adjsPerSec; // 6 mins
   const stresspoint = 4 * adjsPerSec; // 4 mins
   const nstr = stats.openconns + "/" + n;
-  if (adj > breakpoint) {
-    log.w("load: stopping; n:", nstr, "adjs:", adj);
+  if (adj > breakpoint || (verylowram && !notCloud)) {
+    log.w("load: verylowram! freemem:", freemem, "totmem:", totmem);
+    log.w("load: stopping lowram?", verylowram, "; n:", nstr, "adjs:", adj);
     stopAfter(0);
     return;
   } else if (adj > stresspoint) {
+    log.w("load: stress; lowram?", lowram, "mem:", freemem, " / ", totmem);
     log.w("load: stress; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
     n = (minc / 2) | 0;
   } else if (adj > 0) {
+    log.d("load: high; lowram?", lowram, "mem:", freemem, " / ", totmem);
     log.d("load: high; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
+  }
+
+  stats.bp = [avg1, avg5, avg15, adj, n];
+  for (const s of tracker.servers()) {
+    if (!s || !s.listening) continue;
+    s.maxConnections = n;
   }
 
   // nodejs.org/en/docs/guides/diagnostics/memory/using-gc-traces
@@ -1152,29 +1168,6 @@ function adjustMaxConns(n) {
   } else {
     if (isNode) v8.setFlagsFromString("--notrace-gc");
   }
-
-  stats.bp = [avg1, avg5, avg15, adj, n];
-  for (const s of tracker.servers()) {
-    if (!s || !s.listening) continue;
-    s.maxConnections = n;
-  }
-}
-
-/**
- * @param {memwatch.HeapDiff} h
- * @returns void
- */
-function endHeapDiffIfNeeded(h) {
-  // disabled; memwatch is not bundled due to a webpack bug
-  if (!h || true) return;
-  try {
-    const diff = h.end();
-    log.i("heap before", diff.before);
-    log.i("heap after", diff.after);
-    log.i("heap details", diff.change.details);
-  } catch (ex) {
-    log.w("heap-diff err", ex.message);
-  }
 }
 
 function bye() {
@@ -1182,5 +1175,8 @@ function bye() {
   // of other unreleased resources (see: svc.js#systemStop); and so exit with
   // success (exit code 0) regardless; ref: community.fly.io/t/4547/6
   console.warn("W game over");
+
+  if (envutil.isNode()) v8.writeHeapSnapshot("snap.end.heapsnapshot");
+
   process.exit(0);
 }

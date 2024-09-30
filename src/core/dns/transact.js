@@ -9,25 +9,44 @@ import * as bufutil from "../../commons/bufutil.js";
 import * as util from "../../commons/util.js";
 import * as dnsutil from "../../commons/dnsutil.js";
 
+/**
+ * @typedef {import("net").Socket} TcpSock
+ * @typedef {import("dgram").Socket} UdpSock
+ * @typedef {import("net").AddressInfo} AddrInfo
+ */
+
 // TcpTx implements a single DNS question-answer exchange over TCP. It doesn't
 // multiplex multiple DNS questions over the same socket. It doesn't take the
 // ownership of the socket, but requires exclusive use of it. The socket may
 // close itself on errors, however.
 export class TcpTx {
+  /** @param {TcpSock} socket */
   constructor(socket) {
+    /** @type {TcpSock} */
     this.sock = socket;
-    // only one transaction allowed
-    // then done gates all other requests
-    this.done = false;
+    /** @type {boolean} */
+    this.done = false || socket == null; // done gates all other requests
+    /** @type {ScratchBuffer} */
     // reads from the socket is buffered into scratch
     this.readBuffer = this.makeReadBuffer();
+    /** @type {function(Buffer)} */
+    this.resolve = null;
+    /** @type {function(string?)} */
+    this.reject = null;
     this.log = log.withTags("TcpTx");
   }
 
+  /** @param {TcpSock} sock */
   static begin(sock) {
     return new TcpTx(sock);
   }
 
+  /**
+   * @param {string} rxid
+   * @param {Buffer} query
+   * @param {int} timeout
+   * @returns {Promise<Buffer>|null}
+   */
   async exchange(rxid, query, timeout) {
     if (this.done) {
       this.log.w(rxid, "no exchange, tx is done");
@@ -44,7 +63,7 @@ export class TcpTx {
       this.onTimeout(rxid);
     };
     const onError = (err) => {
-      this.onError(rxid);
+      this.onError(rxid, err);
     };
 
     try {
@@ -68,16 +87,22 @@ export class TcpTx {
     }
   }
 
-  // TODO: Same code as in server.js, merge them
+  /**
+   * @param {string} rxid
+   * @param {Buffer} chunk
+   * @returns
+   */
   onData(rxid, chunk) {
+    const cl = bufutil.len(chunk);
+
+    // TODO: Same code as in server.js, merge them
     if (this.done) {
-      this.log.w(rxid, "on reads, tx is closed for business");
+      this.log.w(rxid, "on reads, tx closed; discard", cl);
       return chunk;
     }
 
     const sb = this.readBuffer;
 
-    const cl = chunk.byteLength;
     if (cl <= 0) return;
 
     // read header first which contains length(dns-query)
@@ -130,22 +155,23 @@ export class TcpTx {
     } // continue reading from socket
   }
 
-  onClose(err) {
+  onClose(rxid, err) {
     if (this.done) return; // no-op
-    return err ? this.no("error") : this.no("close");
+    return err ? this.no(err.message) : this.no("close");
   }
 
-  onError(err) {
+  onError(rxid, err) {
     if (this.done) return; // no-op
     this.log.e(rxid, "udp err", err.message);
     this.no(err.message);
   }
 
-  onTimeout() {
+  onTimeout(rxid) {
     if (this.done) return; // no-op
     this.no("timeout");
   }
 
+  /** @returns {Promise<Buffer>} */
   promisedRead() {
     const that = this;
     return new Promise((resolve, reject) => {
@@ -154,44 +180,62 @@ export class TcpTx {
     });
   }
 
+  /**
+   * @param {string} rxid
+   * @param {Buffer} query
+   */
   write(rxid, query) {
+    const qlen = bufutil.len(query);
     if (this.done) {
-      this.log.w(rxid, "no writes, tx is done working");
+      this.log.w(rxid, "no writes, tx is done; discard", qlen);
       return query;
     }
 
     const header = bufutil.createBuffer(dnsutil.dnsHeaderSize);
+    const hlen = bufutil.len(header);
     bufutil.recycleBuffer(header);
-    header.writeUInt16BE(query.byteLength);
+    header.writeUInt16BE(qlen);
 
     this.sock.write(header, () => {
-      this.log.d(rxid, "len(header):", header.byteLength);
+      this.log.d(rxid, "tcp write hdr:", hlen);
     });
     this.sock.write(query, () => {
-      this.log.d(rxid, "len(query):", query.byteLength);
+      this.log.d(rxid, "tcp write q:", qlen);
     });
   }
 
+  /**
+   * @param {Buffer} val
+   */
   yes(val) {
     this.done = true;
     this.resolve(val);
   }
 
+  /**
+   * @param {string?|Error} reason
+   */
   no(reason) {
     this.done = true;
     this.reject(reason);
   }
 
+  /** @returns {ScratchBuffer} */
   makeReadBuffer() {
-    const qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
-    const qlenBufOffset = bufutil.recycleBuffer(qlenBuf);
+    return new ScratchBuffer();
+  }
+}
 
-    return {
-      qlenBuf: qlenBuf,
-      qlenBufOffset: qlenBufOffset,
-      qBuf: null,
-      qBufOffset: 0,
-    };
+class ScratchBuffer {
+  constructor() {
+    /** @type {Buffer} */
+    this.qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
+    /** @type {int} */
+    this.qlenBufOffset = bufutil.recycleBuffer(this.qlenBuf);
+    /** @type {Buffer} */
+    this.qBuf = null;
+    /** @type {int} */
+    this.qBufOffset = 0;
   }
 }
 
@@ -200,19 +244,32 @@ export class TcpTx {
 // ownership of the socket, but requires exclusive access to it. The socket
 // may close itself on errors, however.
 export class UdpTx {
+  /** @param {UdpSock} socket */
   constructor(socket) {
+    /** @type {UdpSock} */
     this.sock = socket;
-    // only one transaction allowed
-    this.done = false;
-    // ticks socket io timeout
-    this.timeoutTimerId = null;
+    /** @type {boolean} */
+    this.done = false || socket == null; // only one transaction allowed
+    /** @type {NodeJS.Timeout|-1} */
+    this.timeoutTimerId = null; // ticks socket io timeout
+    /** @type {function(Buffer)} */
+    this.resolve = null;
+    /** @type {function(string)} */
+    this.reject = null;
     this.log = log.withTags("UdpTx");
   }
 
+  /** @param {UdpSock} sock */
   static begin(sock) {
     return new UdpTx(sock);
   }
 
+  /**
+   * @param {string} rxid
+   * @param {Buffer} query
+   * @param {int} timeout
+   * @returns {Promise<Buffer>|null}
+   */
   async exchange(rxid, query, timeout) {
     if (this.done) {
       this.log.w(rxid, "no exchange, tx is done");
@@ -246,15 +303,26 @@ export class UdpTx {
     }
   }
 
+  /**
+   * @param {string} rxid
+   * @param {Buffer} query
+   * @returns
+   */
   write(rxid, query) {
     if (this.done) return; // discard
-    this.log.d(rxid, "udp write");
+    this.log.d(rxid, "udp write", bufutil.len(query));
     this.sock.send(query); // err-on-write handled by onError
   }
 
+  /**
+   * @param {string} rxid
+   * @param {Buffer} b
+   * @param {AddrInfo} addrinfo
+   * @returns
+   */
   onMessage(rxid, b, addrinfo) {
     if (this.done) return; // discard
-    this.log.d(rxid, "udp read");
+    this.log.d(rxid, "udp read", bufutil.len(b));
     this.yes(b);
   }
 
@@ -270,6 +338,10 @@ export class UdpTx {
     return err ? this.no("error") : this.no("close");
   }
 
+  /**
+   * @param {int} timeout
+   * @returns {Promise<Buffer>}
+   */
   promisedRead(timeout = 0) {
     const that = this;
     if (timeout > 0) {
@@ -283,6 +355,7 @@ export class UdpTx {
     });
   }
 
+  /** @param {Buffer} val */
   yes(val) {
     if (this.done) return;
 
@@ -291,6 +364,7 @@ export class UdpTx {
     this.resolve(val);
   }
 
+  /** @param {string|Error} reason */
   no(reason) {
     if (this.done) return;
 

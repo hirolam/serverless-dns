@@ -2,7 +2,8 @@ app = ""
 
 kill_signal = "SIGINT"
 kill_timeout = "15s"
-swap_size_mb = 152
+# swap must be disabled when using "suspend"
+# swap_size_mb = 152
 
 [build]
   dockerfile = "node.Dockerfile"
@@ -20,11 +21,18 @@ swap_size_mb = 152
 [experimental]
 auto_rollback = true
 
+# community.fly.io/t/19180
+# fly.io/docs/machines/guides-examples/machine-restart-policy
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
 # DNS over HTTPS (well, h2c and http1.1)
 [[services]]
   internal_port = 8055
   protocol = "tcp"
-  auto_stop_machines = true
+  # community.fly.io/t/20672
+  auto_stop_machines = "suspend"
   auto_start_machines = true
 
   [services.concurrency]
@@ -57,7 +65,7 @@ auto_rollback = true
 [[services]]
   internal_port = 10555
   protocol = "tcp"
-  auto_stop_machines = true
+  auto_stop_machines = "suspend"
   auto_start_machines = true
 
   [services.concurrency]

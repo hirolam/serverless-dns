@@ -8,12 +8,17 @@
 import { UserCache } from "./user-cache.js";
 import * as pres from "../plugin-response.js";
 import * as util from "../../commons/util.js";
+import * as envutil from "../../commons/envutil.js";
 import * as rdnsutil from "../rdns-util.js";
 import * as token from "./auth-token.js";
-import * as bufutil from "../../commons/bufutil.js";
+import * as dnsutil from "../../commons/dnsutil.js";
 
 // TODO: determine an approp cache-size
 const cacheSize = 20000;
+
+// use fixed doh upstream for these domains,
+// instead of either recursing (on Fly.io)
+const delegated = new Set(["ipv4only.arpa"]);
 
 export class UserOp {
   constructor() {
@@ -22,7 +27,7 @@ export class UserOp {
   }
 
   /**
-   * @param {{request: Request, isDnsMsg: Boolean, rxid: string}} ctx
+   * @param {{request: Request, requestDecodedDnsPacket: any, isDnsMsg: Boolean, rxid: string}} ctx
    * @returns {Promise<pres.RResp>}
    */
   async exec(ctx) {
@@ -44,11 +49,11 @@ export class UserOp {
   }
 
   /**
-   * @param {{request: Request, isDnsMsg: Boolean, rxid: string}} ctx
+   * @param {{request: Request, requestDecodedDnsPacket: any, isDnsMsg: Boolean, rxid: string}} ctx
    * @returns {pres.RResp}
    */
   loadUser(ctx) {
-    let response = pres.emptyResponse();
+    const response = pres.emptyResponse();
 
     if (!ctx.isDnsMsg) {
       this.log.w(ctx.rxid, "not a dns-msg, ignore");
@@ -56,18 +61,29 @@ export class UserOp {
     }
 
     try {
-      const blocklistFlag = rdnsutil.blockstampFromUrl(ctx.request.url);
-
-      if (util.emptyString(blocklistFlag)) {
-        this.log.d(ctx.rxid, "empty blocklist-flag", ctx.request.url);
+      const dnsPacket = ctx.requestDecodedDnsPacket;
+      const domains = dnsutil.extractDomains(dnsPacket);
+      for (const d of domains) {
+        if (delegated.has(d)) {
+          // may be overriden by user-preferred doh upstream
+          response.data.dnsResolverUrl = envutil.primaryDohResolver();
+        }
       }
 
+      const blocklistFlag = rdnsutil.blockstampFromUrl(ctx.request.url);
+      const hasflag = !util.emptyString(blocklistFlag);
+      if (!hasflag) {
+        this.log.d(ctx.rxid, "empty blocklist-flag", ctx.request.url);
+      }
       // blocklistFlag may be invalid, ref rdnsutil.blockstampFromUrl
       let r = this.userConfigCache.get(blocklistFlag);
-      if (!util.emptyString(blocklistFlag) && util.emptyObj(r)) {
-        r = rdnsutil.unstamp(blocklistFlag);
+      let hasdata = rdnsutil.hasBlockstamp(r);
+      if (hasflag && !hasdata) {
+        // r not in cache
+        r = rdnsutil.unstamp(blocklistFlag); // r is never null, may throw ex
+        hasdata = rdnsutil.hasBlockstamp(r);
 
-        if (!bufutil.emptyBuf(r.userBlocklistFlagUint)) {
+        if (hasdata) {
           this.log.d(ctx.rxid, "new cfg cache kv", blocklistFlag, r);
           // TODO: blocklistFlag is not normalized, ie b32 used for dot isn't
           // converted to its b64 form (which doh and rethinkdns modules use)
@@ -75,16 +91,18 @@ export class UserOp {
           this.userConfigCache.put(blocklistFlag, r);
         }
       } else {
-        this.log.d(ctx.rxid, "cfg cache hit?", r != null, blocklistFlag, r);
+        this.log.d(ctx.rxid, "cfg cache hit?", hasdata, blocklistFlag, r);
       }
 
-      response.data.userBlocklistInfo = r;
-      response.data.userBlocklistFlag = blocklistFlag;
-      // sets user-preferred doh upstream
-      response.data.dnsResolverUrl = null;
+      if (hasdata) {
+        response.data.userBlocklistInfo = r;
+        response.data.userBlocklistFlag = blocklistFlag;
+        // TODO: override response.data.dnsResolverUrl
+      }
     } catch (e) {
       this.log.e(ctx.rxid, "loadUser", e);
-      response = pres.errResponse("UserOp:loadUser", e);
+      // avoid erroring out on invalid blocklist info & flag
+      // response = pres.errResponse("UserOp:loadUser", e);
     }
 
     return response;
